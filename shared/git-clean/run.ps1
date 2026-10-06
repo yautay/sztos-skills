@@ -1,14 +1,4 @@
-# Launcher dla PowerShella: uruchamia audit.sh / sync.sh / report.sh w Git Bash.
-#
-# Użycie:  & "$env:USERPROFILE\.claude\skills\git-clean\run.ps1" audit  [argumenty audit.sh]
-#          & "$env:USERPROFILE\.claude\skills\git-clean\run.ps1" sync   [argumenty sync.sh]
-#          & "$env:USERPROFILE\.claude\skills\git-clean\run.ps1" report [argumenty report.py, np. --open]
-#
-# Po co: w PowerShellu `bash` na PATH bywa bashem z WSL (C:\Windows\System32\bash.exe),
-# a `~` nie jest rozwijane przy wywołaniu natywnego programu. Skrypty wymagają Git Bash.
-# Skrypt szuka bin\bash.exe obok zainstalowanego git.exe.
-
-param(
+﻿param(
     [Parameter(Mandatory = $true, Position = 0)][ValidateSet('audit', 'sync', 'report')][string]$Script,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest
 )
@@ -35,5 +25,7 @@ if (-not $bash) {
 $env:PYTHONUTF8 = '1'
 
 $sh = (Join-Path $PSScriptRoot "$Script.sh") -replace '\\', '/'
-& $bash $sh @Rest
+# Git's Unix helpers may be missing from the inherited Windows PATH.
+# Positional parameters preserve spaces and shell metacharacters in paths/arguments.
+& $bash -c 'export PATH="/usr/bin:/bin:$PATH"; exec bash "$@"' -- $sh @Rest
 exit $LASTEXITCODE

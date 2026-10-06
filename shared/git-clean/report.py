@@ -24,6 +24,11 @@ import argparse
 import html
 import json
 import re
+import os
+import shlex
+from urllib.parse import unquote
+
+import graph
 import subprocess
 import sys
 import webbrowser
@@ -67,7 +72,7 @@ def kv(lines: list[str]) -> dict[str, str]:
     return d
 
 
-def rows(lines: list[str], names: list[str]) -> list[dict[str, str]]:
+def rows(lines: list[str], names: list[str], encoded: bool = False) -> list[dict[str, str]]:
     out, started = [], False
     for line in lines:
         if line.startswith("# "):
@@ -77,6 +82,8 @@ def rows(lines: list[str], names: list[str]) -> list[dict[str, str]]:
             continue
         parts = line.split("|", len(names) - 1)
         parts += [""] * (len(names) - len(parts))
+        if encoded:
+            parts = [unquote(p) for p in parts]
         out.append(dict(zip(names, parts)))
     return out
 
@@ -97,13 +104,16 @@ LOCAL_F = ["name", "upstream", "track", "vs_upstream", "vs_base", "ms", "local_o
            "age", "author", "worktree", "sha", "subject"]
 REMOTE_F = ["name", "vs_base", "ms", "age", "author", "has_local", "sha", "subject"]
 STASH_F = ["ref", "age", "created_on", "files", "untracked", "reach", "same_head",
-           "same_base", "rev_applies", "sha", "file_list", "message"]
+           "same_base", "rev_applies", "sha", "file_list", "index_state", "message"]
 SYNC_F = ["branch", "status", "behind", "ahead", "old_sha", "new_sha", "detail"]
 
 
 def parse_audit(text: str) -> dict:
     s = parse_sections(text)
     repo = kv(s.get("REPO", []))
+    encoded = repo.get("format_version") == "2"
+    if encoded:
+        repo = {k: unquote(v) for k, v in repo.items()}
     rem_lines = s.get("REMOTES", [])
     rem = kv(rem_lines)
     fetch = rem.get("fetch", "")
@@ -117,6 +127,8 @@ def parse_audit(text: str) -> dict:
         net = "skipped"
     deflines = s.get("DEFAULT BRANCH", [])
     d = kv(deflines)
+    if encoded:
+        d = {k: unquote(v) for k, v in d.items()}
     trunk = [x.split(": ", 1)[1] for x in deflines if x.startswith("trunk_like: ")]
     wt_lines = s.get("WORKING TREE", [])
     wtree = kv(wt_lines)
@@ -128,6 +140,15 @@ def parse_audit(text: str) -> dict:
     stash_lines = s.get("STASH", [])
     tag_lines = s.get("LOCAL TAGS NOT ON REMOTE")
     health = kv(s.get("REPO HEALTH", []))
+    graph_lines = s.get("GRAPH COMMITS", [])
+    graph_limit = min(1000, max(1, to_int(kv(graph_lines).get("graph_limit", "120"), 120)))
+    commits = rows(graph_lines, ["oid", "parents", "author", "subject"], encoded)
+    commits = [c for c in commits if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", c['oid'])
+               and all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", p) for p in c['parents'].split())]
+    stash_fields = STASH_F if encoded else [f for f in STASH_F if f != 'index_state']
+    stashes = rows(stash_lines, stash_fields, encoded)
+    for st in stashes:
+        st.setdefault('index_state', 'unknown')
     return {
         "root": repo.get("root", ""),
         "current": repo.get("current_branch", ""),
@@ -145,12 +166,15 @@ def parse_audit(text: str) -> dict:
         "in_progress": in_progress,
         "worktrees": wts,
         "prunable": prunable,
-        "local": rows(s.get("LOCAL BRANCHES", []), LOCAL_F),
-        "remote_rows": rows(rlines, REMOTE_F),
+        "local": rows(s.get("LOCAL BRANCHES", []), LOCAL_F, encoded),
+        "remote_rows": rows(rlines, REMOTE_F, encoded),
         "remote_limit": kv(rlines).get("remote_limit", ""),
         "stale_refs": [x.strip() for x in stale if "would prune" in x],
         "stale_checked": not any("nie sprawdzono" in x for x in stale),
-        "stash": rows(stash_lines, STASH_F),
+        "stash": stashes,
+        "graph": commits[:graph_limit],
+        "graph_truncated": len(commits) > graph_limit,
+        "graph_refs": rows(s.get("GRAPH REFS", []), ["ref", "oid"], encoded),
         "tags_unpushed": None if tag_lines is None else [x for x in tag_lines if x != "(brak)"],
         "health": health,
         "stale_days": to_int(health.get("stale_days_threshold", "90"), 90),
@@ -182,7 +206,7 @@ def parse_sync(text: str, mtime: float) -> dict:
         "mode": m.group(3) if m else "?",
         "base": m.group(1) if m else "?",
         "base_sha": m.group(2) if m else "",
-        "rows": rows(lines, SYNC_F),
+        "rows": rows(lines, SYNC_F, "format_version: 2" in text.splitlines()),
         "conflicts": conflicts,
         "push": push,
         "notes": {k: v for k, v in kv(find(s, "UWAGI")[1]).items() if k != "podsumowanie"},
@@ -207,7 +231,24 @@ CAT_LABEL = {
 }
 
 
-def classify(a: dict, protected: str) -> dict:
+def quote_arg(value: str, shell: str = "bash") -> str:
+    return "'" + value.replace("'", "''") + "'" if shell == "powershell" else shlex.quote(value)
+
+
+def git_command(*args: str, shell: str = "bash") -> str:
+    return "git " + " ".join(quote_arg(arg, shell) for arg in args)
+
+
+def translate_command(command: str, shell: str) -> str:
+    if command.startswith('#') or shell == 'bash':
+        return command
+    # sync.sh emits Bash-quoted commands. Convert the argument vector, never eval it.
+    return " ".join(quote_arg(arg, shell) for arg in shlex.split(command))
+
+
+def classify(a: dict, protected: str, shell: str = "bash") -> dict:
+    def command(*args):
+        return git_command(*args, shell=shell)
     prot = re.compile(protected)
     cur, default = a["current"], a["default"]
     plan = {k: [] for k in "ABCDE"}
@@ -244,21 +285,21 @@ def classify(a: dict, protected: str) -> dict:
         if b["ms"] == "NOT_MERGED" and age > a["stale_days"]:
             cats.append("abandoned")
 
-        if b["ms"] == "contained" and not ({"default", "protected"} & set(cats)):
+        if b["ms"] == "contained" and not ({"default", "protected", "current", "worktree"} & set(cats)):
             cats.append("decide")
             plan["E"].append({"text": f"{name} — czubek leży na głównej linii {a['base']} (brak własnych commitów): świeżo założona "
                                       "albo zmergowana fast-forwardem; usunięcie nie traci żadnej pracy",
-                              "cmd": f"git branch -d {name}", "sha": b["sha"]})
+                              "cmd": command("branch", "-d", "--", name), "sha": b["sha"]})
         elif merged and not ({"default", "protected"} & set(cats)):
             sha = b["sha"]
             if name == cur:
                 cats.append("decide")
                 plan["E"].append({"text": f"{name} — zmergowana ({b['ms']}), ale to bieżąca gałąź: najpierw przełącz się na {default}",
-                                  "cmd": f"git switch {default}", "sha": sha})
+                                  "cmd": command("switch", "--", default), "sha": sha})
             elif in_wt:
                 cats.append("decide")
                 plan["E"].append({"text": f"{name} — zmergowana ({b['ms']}), ale wystawiona w worktree {b['worktree']}: najpierw usuń worktree",
-                                  "cmd": f"git worktree remove {b['worktree']}", "sha": sha})
+                                  "cmd": command("worktree", "remove", "--", b["worktree"]), "sha": sha})
             else:
                 cats.append("safe")
                 flag = "-d" if b["ms"] == "merged" else "-D"
@@ -267,15 +308,15 @@ def classify(a: dict, protected: str) -> dict:
                        "squashed": "cała treść jest w bazie jako squash (-D, bo git nie rozpozna squasha)"}[b["ms"]]
                 if lo:
                     why += f"; {lo} commit(ów) nie ma na remote, ale ich treść jest w bazie"
-                plan["A"].append({"cmd": f"git branch {flag} {name}", "sha": sha, "why": why})
-        elif "abandoned" in cats:
+                plan["A"].append({"cmd": command("branch", flag, "--", name), "sha": sha, "why": why})
+        elif "abandoned" in cats and not ({"default", "protected", "current", "worktree"} & set(cats)):
             plan["E"].append({"text": f"{name} — porzucona: {age} dni bez commita, niezmergowana"
                                       + (f", {lo} commit(ów) TYLKO lokalnie" if lo else ""),
-                              "cmd": f"git branch -D {name}", "sha": b["sha"]})
+                              "cmd": command("branch", "-D", "--", name), "sha": b["sha"]})
         elif "gone" in cats and lo > 0:
             plan["E"].append({"text": f"{name} — upstream zniknął z serwera, a {lo} commit(ów) istnieje tylko u Ciebie "
                                       "(push wykonuje użytkownik)",
-                              "cmd": f"git push -u {a['remote'] or 'origin'} {name}", "sha": b["sha"]})
+                              "cmd": command("push", "-u", "--", a["remote"] or "origin", name), "sha": b["sha"]})
         if not cats or cats == ["worktree"] or cats == ["current"] or cats == ["current", "worktree"]:
             cats.append("active")
         b["cats"] = list(dict.fromkeys(cats))
@@ -289,12 +330,16 @@ def classify(a: dict, protected: str) -> dict:
             unchecked += 1
         if r["name"] == default or prot.search(r["name"]):
             continue
+        if r["ms"] in MERGED_LIKE + ("contained",) and a["net"] != "fresh":
+            plan["E"].append({"text": f"{remote_name}/{r['name']} — przed usunięciem potrzebny świeży fetch",
+                              "cmd": "# ponów audyt z dostępem do remote", "sha": r["sha"]})
+            continue
         if r["ms"] == "contained":
             plan["E"].append({"text": f"{remote_name}/{r['name']} — czubek na głównej linii bazy (brak własnych commitów): "
                                       f"świeżo założona albo fast-forward; {r['age']} dni, {r['author']}",
-                              "cmd": f"git push {remote_name} --delete {r['name']}", "sha": r["sha"]})
+                              "cmd": command("push", "--delete", "--", remote_name, r["name"]), "sha": r["sha"]})
         elif r["ms"] in MERGED_LIKE:
-            plan["B"].append({"cmd": f"git push {remote_name} --delete {r['name']}", "sha": r["sha"],
+            plan["B"].append({"cmd": command("push", "--delete", "--", remote_name, r["name"]), "sha": r["sha"],
                               "why": f"{r['ms']}, {r['age']} dni, {r['author']}"})
 
     # Stash
@@ -305,7 +350,10 @@ def classify(a: dict, protected: str) -> dict:
         in_base = nf > 0 and st["same_base"] == f"{nf}/{nf}"
         in_tree = st["rev_applies"] == "yes" and nf > 0
         unreachable = st["reach"] == "NIEOSIĄGALNY"
-        if (in_base or in_tree) and ut == 0:
+        index_safe = st.get("index_state") in ("base", "worktree")
+        if not index_safe:
+            verdict, kind = "indeks stasha zawiera osobną treść albo nie został sprawdzony — zachowaj", "rescue"
+        elif (in_base or in_tree) and ut == 0:
             verdict, kind = ("treść już jest w bazie" if in_base else "treść już jest w drzewie roboczym"), "drop"
         elif nf == 0 and ut == 0:
             verdict, kind = "pusty", "drop"
@@ -317,26 +365,26 @@ def classify(a: dict, protected: str) -> dict:
         stash_eval.append(ev)
     for ev in sorted(stash_eval, key=lambda e: -e["idx"]):
         if ev["kind"] == "drop":
-            plan["C"].append({"cmd": f"git stash drop 'stash@{{{ev['idx']}}}'", "sha": ev["sha"], "why": ev["verdict"]})
+            plan["C"].append({"cmd": command("stash", "drop", f"stash@{{{ev['idx']}}}"), "sha": ev["sha"], "why": ev["verdict"]})
     for ev in sorted(stash_eval, key=lambda e: e["idx"]):
         if ev["kind"] == "rescue":
             slug = re.sub(r"[^A-Za-z0-9._-]+", "-", ev["created_on"] or "stash").strip("-")[:40] or "stash"
             plan["E"].append({"text": f"stash@{{{ev['idx']}}} — {ev['verdict']} ({ev['nf']} plik(ów)"
                                       + (f" + {ev['ut']} nieśledzonych" if ev["ut"] else "")
                                       + f", {ev['age']} dni); `git stash branch` przełącza bieżący worktree na nową gałąź",
-                              "cmd": f"git stash branch rescue/stash-{ev['idx']}-{slug} 'stash@{{{ev['idx']}}}'",
+                              "cmd": command("stash", "branch", f"rescue/stash-{ev['idx']}-{slug}", f"stash@{{{ev['idx']}}}"),
                               "sha": ev["sha"]})
 
     # Śmieci techniczne
     if a["stale_refs"]:
-        plan["D"].append({"cmd": f"git remote prune {remote_name}", "sha": "",
+        plan["D"].append({"cmd": command("remote", "prune", "--", remote_name), "sha": "",
                           "why": f"{len(a['stale_refs'])} gałęzi zdalnych usuniętych na serwerze"})
     if a["prunable"]:
-        plan["D"].append({"cmd": "git worktree prune", "sha": "", "why": f"{len(a['prunable'])} martwych wpisów worktree"})
+        plan["D"].append({"cmd": command("worktree", "prune"), "sha": "", "why": f"{len(a['prunable'])} martwych wpisów worktree"})
     garbage = to_int(a["health"].get("garbage", "0"))
     loose = to_int(a["health"].get("count", "0"))
     if garbage > 0 or loose > 5000:
-        plan["D"].append({"cmd": "git gc", "sha": "", "why": f"garbage={garbage}, luźnych obiektów {loose}"})
+        plan["D"].append({"cmd": command("gc"), "sha": "", "why": f"garbage={garbage}, luźnych obiektów {loose}"})
 
     # Alerty
     alerts = []
@@ -395,12 +443,27 @@ def save_and_diff(outdir: Path, a: dict) -> dict | None:
     if not prev:
         return None
 
+    def same_sha(left, right):
+        return (isinstance(left, str) and isinstance(right, str)
+                and re.fullmatch(r'[0-9a-f]{7,64}', left) is not None
+                and re.fullmatch(r'[0-9a-f]{7,64}', right) is not None
+                and (left.startswith(right) or right.startswith(left)))
+
+    # Older snapshots used abbreviated IDs. A switch to full IDs is not a ref update.
+    old_stash = prev.get('stash', {})
+    migrated_stash = {}
+    for oid, message in old_stash.items():
+        matches = [current for current in snap['stash'] if same_sha(oid, current)]
+        migrated_stash[matches[0] if len(matches) == 1 else oid] = message
+    prev['stash'] = migrated_stash
+
     def delta(key):
         p, c = prev.get(key, {}), snap[key]
         return {
             "removed": sorted(set(p) - set(c)),
             "added": sorted(set(c) - set(p)),
-            "changed": sorted(k for k in set(p) & set(c) if p[k] != c[k]),
+            "changed": sorted(k for k in set(p) & set(c)
+                              if p[k] != c[k] and not (key in ('local', 'remote') and same_sha(p[k], c[k]))),
         }
 
     return {"since": prev["generated_at"], "local": delta("local"), "remote": delta("remote"),
@@ -554,6 +617,8 @@ def render(a: dict, cl: dict, sync: dict | None, diff: dict | None, sources: lis
     for kind, text in cl["alerts"]:
         w(f'<div class="alert {kind}">{e(text)}</div>')
 
+    w(graph.render_graph(a))
+
     # Zmiany od poprzedniego raportu
     if diff:
         items = []
@@ -696,7 +761,7 @@ def render(a: dict, cl: dict, sync: dict | None, diff: dict | None, sources: lis
               '<th>gałąź</th><th>stare SHA</th><th>cofnięcie</th></tr></thead><tbody>')
             for r in upd:
                 wt = wt_of.get(r["branch"], "-")
-                undo = f'git branch -f {r["branch"]} {r["old_sha"]}' if wt in ("", "-") else f'git -C {wt} reset --hard {r["old_sha"]}'
+                undo = git_command('branch', '-f', '--', r['branch'], r['old_sha'], shell=a.get('shell', 'bash')) if wt in ('', '-') else git_command('-C', wt, 'reset', '--keep', r['old_sha'], shell=a.get('shell', 'bash'))
                 w(f'<tr><td><code>{e(r["branch"])}</code></td><td><code>{e(r["old_sha"])}</code></td><td><code>{e(undo)}</code></td></tr>')
             w("</tbody></table></div></details>")
 
@@ -705,8 +770,8 @@ def render(a: dict, cl: dict, sync: dict | None, diff: dict | None, sources: lis
 
     return ('<!doctype html><html lang="pl"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>git-clean · {e(repo_name)}</title><style>{CSS}</style></head>'
-            f'<body><main>{"".join(P)}</main><script>{JS}</script></body></html>')
+            f'<title>git-clean · {e(repo_name)}</title><style>{CSS}{graph.CSS}</style></head>'
+            f'<body><main>{"".join(P)}</main><script>{JS}{graph.JS}</script></body></html>')
 
 
 # ---------------------------------------------------------------- tekst dla modelu
@@ -720,7 +785,8 @@ def text_summary(a: dict, cl: dict, sync: dict | None, diff: dict | None, out: P
     w(f"repo: {a['root']} | gałąź: {a['current']} | baza: {a['base']} | remote: {net}")
     lo = [b["name"] for b in a["local"] if "local_only" in b["cats"]]
     w(f"gałęzi lokalnych: {len(a['local'])} | do usunięcia A: {len(plan['A'])} | remote B: {len(plan['B'])} | "
-      f"stash: {len(a['stash'])} | worktree: {len(a['worktrees'])} | z pracą tylko lokalnie: {len(lo)}"
+      f"do usunięcia C: {len(plan['C'])} | stash do oceny E: {sum(s['kind'] == 'rescue' for s in cl['stash'])} | "
+      f"stash łącznie: {len(a['stash'])} | worktree: {len(a['worktrees'])} | z pracą tylko lokalnie: {len(lo)}"
       + (f" ({', '.join(lo)})" if lo else ""))
     for kind, text in cl["alerts"]:
         w(f"ALERT[{kind}]: {text}")
@@ -790,6 +856,7 @@ def main() -> int:
     ap.add_argument("--sync", choices=["auto", "dryrun", "apply", "none"], default="auto")
     ap.add_argument("--protected", default=PROTECTED_DEFAULT)
     ap.add_argument("--open", action="store_true")
+    ap.add_argument("--shell", choices=["bash", "powershell"], default="powershell" if os.name == "nt" else "bash")
     args = ap.parse_args()
 
     res = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True)
@@ -818,7 +885,10 @@ def main() -> int:
             sync = parse_sync(pick.read_text(encoding="utf-8", errors="replace"), pick.stat().st_mtime)
             sources.append(pick.name)
 
-    cl = classify(a, args.protected)
+    a['shell'] = args.shell
+    if sync and 'push' in sync:
+        sync['push'] = [translate_command(c, args.shell) for c in sync['push']]
+    cl = classify(a, args.protected, args.shell)
     diff = save_and_diff(outdir, a)
     out = outdir / "report.html"
     out.write_text(render(a, cl, sync, diff, sources, args.protected), encoding="utf-8")

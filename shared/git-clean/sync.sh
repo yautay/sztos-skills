@@ -29,16 +29,19 @@
 #   --sync-worktrees  aktualizuj też gałęzie wystawione w innych worktree
 
 set -u
+source "$(dirname "$0")/common.sh"
 export LC_ALL=C
 export GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never
 
 # Kopia wyjścia dla report.py: uruchom się ponownie z tee do .git/git-clean/.
 if [ -z "${GIT_CLEAN_TEED:-}" ] && git rev-parse --git-dir >/dev/null 2>&1; then
   OUTDIR="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/git-clean"
-  mkdir -p "$OUTDIR"
+  mkdir -p "$OUTDIR" || exit 2
   case " $* " in *" --dry-run "*) OUTF=sync-dryrun.txt ;; *) OUTF=sync-apply.txt ;; esac
   GIT_CLEAN_TEED=1 bash "$0" "$@" 2>&1 | tee "$OUTDIR/$OUTF"
-  exit "${PIPESTATUS[0]}"
+  codes=("${PIPESTATUS[@]}")
+  [ "${codes[0]}" -ne 0 ] && exit "${codes[0]}"
+  exit "${codes[1]}"
 fi
 
 DRY=0; SUFFIX=""; TRAILER=""; SYNC_WT=0
@@ -47,10 +50,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --sync-worktrees) SYNC_WT=1 ;;
-    --msg-suffix) SUFFIX="$2"; shift ;;
-    --trailer) TRAILER="$2"; shift ;;
-    --protected) PROTECTED="$2"; shift ;;
-    *) echo "nieznany argument: $1" >&2 ;;
+    --msg-suffix) SUFFIX="${2:?brak wartości argumentu}"; shift ;;
+    --trailer) TRAILER="${2:?brak wartości argumentu}"; shift ;;
+    --protected) PROTECTED="${2:?brak wartości argumentu}"; shift ;;
+    *) echo "nieznany argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
@@ -85,19 +88,24 @@ is_foreign_wt() { # $1 worktree path -> 0, gdy to INNY worktree i nie ma --sync-
 squash_merged() { # $1 ref, $2 base
   local mb tmp
   mb=$(git merge-base "$2" "$1" 2>/dev/null) || return 1
-  tmp=$(git commit-tree "$1^{tree}" -p "$mb" -m tmp 2>/dev/null) || return 1
+  tmp=$(git -c commit.gpgsign=false commit-tree "$1^{tree}" -p "$mb" -m tmp 2>/dev/null) || return 1
   case "$(git cherry "$2" "$tmp" 2>/dev/null)" in -*) return 0 ;; esac
   return 1
 }
 already_in_base() { # $1 ref
   git merge-base --is-ancestor "$1" "$BASE" 2>/dev/null && return 0
-  [ -z "$(git cherry "$BASE" "$1" 2>/dev/null | grep '^+')" ] && return 0
+  local cherry
+  cherry=$(git cherry "$BASE" "$1" 2>/dev/null) || return 1
+  ! printf '%s\n' "$cherry" | grep -q '^+' && return 0
   squash_merged "$1" "$BASE" && return 0
   return 1
 }
 wt_blocker() { # $1 worktree path -> wypisuje powód blokady albo nic
-  local wt="$1" op
-  if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+  local wt="$1" op state
+  state=$(git -C "$wt" status --porcelain --untracked-files=normal 2>/dev/null) || {
+    echo "nie udało się sprawdzić stanu worktree"; return;
+  }
+  if [ -n "$state" ]; then
     echo "brudny worktree"; return
   fi
   for op in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
@@ -110,15 +118,16 @@ msg_for() { # $1 branch
   printf '%s' "$m"
 }
 push_cmd() { # $1 branch -> komenda push albo adnotacja (gałąź po aktualizacji)
-  local b="$1" rem merge rname up a bh
+  local b="$1" rem merge rname up a bh qb
+  qb=$(quote_arg "$b")
   rem=$(git config "branch.$b.remote" 2>/dev/null)
   merge=$(git config "branch.$b.merge" 2>/dev/null)
   if [ -z "$rem" ] || [ -z "$merge" ]; then
-    echo "git push -u $R $b"; return
+    echo "git push -u $(quote_arg "$R") $qb"; return
   fi
   rname=${merge#refs/heads/}
   if ! git show-ref --verify --quiet "refs/remotes/$rem/$rname"; then
-    echo "# $b: upstream $rem/$rname zniknął z serwera — decyzja ownera, czy wypchnąć ponownie: git push -u $rem $b:$rname"; return
+    echo "# $b: upstream $rem/$rname zniknął z serwera — decyzja ownera, czy wypchnąć ponownie: git push -u $(quote_arg "$rem") $(quote_arg "$b:$rname")"; return
   fi
   set -- $(git rev-list --left-right --count "refs/heads/$b...refs/remotes/$rem/$rname")
   a=$1; bh=$2
@@ -126,15 +135,16 @@ push_cmd() { # $1 branch -> komenda push albo adnotacja (gałąź po aktualizacj
     echo "# $b: ROZJAZD z $rem/$rname (ahead $a, behind $bh) — najpierw uzgodnij z upstreamem (pull), push zablokowany"; return
   fi
   [ "$a" -eq 0 ] && return
-  if [ "$rname" = "$b" ]; then echo "git push $rem $b"; else echo "git push $rem $b:$rname"; fi
+  if [ "$rname" = "$b" ]; then echo "git push $(quote_arg "$rem") $qb"; else echo "git push $(quote_arg "$rem") $(quote_arg "$b:$rname")"; fi
 }
 
 # ---------- przebieg ----------
-ROWS=(); CONFL=(); PUSHES=(); UPDATED=()
+ROWS=(); CONFL=(); PUSHES=(); UPDATED=(); FAILED=0
+echo "format_version: 2"
 section "SYNC (baza: $BASE @ ${BASE_SHA:0:9}) tryb: $([ $DRY = 1 ] && echo dry-run || echo apply)"
 echo "# branch|status|behind|ahead|old_sha|new_sha|detail"
 
-while IFS='|' read -r b wt; do
+while IFS="$SEP" read -r b wt; do
   old=$(git rev-parse "refs/heads/$b")
   set -- $(git rev-list --left-right --count "refs/heads/$b...$BASE"); ahead=$1; behind=$2
   status=""; new="-"; detail=""
@@ -184,7 +194,7 @@ while IFS='|' read -r b wt; do
             mrc=$?
           fi
           if [ $mrc -eq 0 ]; then status=MERGED; new=$(git rev-parse "refs/heads/$b"); UPDATED+=("$b"); detail="merge $BASE (+$behind commit(ów) z bazy), bez konfliktów"
-          else status=ERROR; detail="merge nieudany mimo czystego merge-tree (rc=$mrc) — gałąź nietknięta"; fi
+          else status=ERROR; detail="merge nieudany mimo czystego merge-tree (rc=$mrc) — sprawdź stan gałęzi"; fi
         fi
       elif [ $rc -eq 1 ]; then
         status=CONFLICT
@@ -193,14 +203,15 @@ while IFS='|' read -r b wt; do
         detail="$nfiles plik(ów) w konflikcie z $BASE"
         owners=$(git log --format='%an <%ae>' "$BASE..refs/heads/$b" 2>/dev/null | sort | uniq -c | sort -rn | head -3 | sed -E 's/^ *([0-9]+) /\1 commit(ów): /' | paste -sd ';' -)
         [ -z "$owners" ] && owners="(brak własnych commitów)"
-        CONFL+=("$b|$behind|$ahead|$owners|$(echo "$files" | head -15 | paste -sd ',' -)|$nfiles")
+        CONFL+=("$b$SEP$behind$SEP$ahead$SEP$owners$SEP$(echo "$files" | head -15 | paste -sd ',' -)$SEP$nfiles")
       else
         status=ERROR; detail="merge-tree zwrócił rc=$rc"
       fi
     fi
   fi
-  ROWS+=("$b|$status|$behind|$ahead|${old:0:9}|${new:0:9}|$detail")
-done < <(git for-each-ref refs/heads --format='%(refname:short)|%(worktreepath)')
+  ROWS+=("$(row "$b" "$status" "$behind" "$ahead" "$old" "$new" "$detail")")
+  if [ "$status" = ERROR ]; then FAILED=1; break; fi
+done < <(git for-each-ref refs/heads --format='%(refname:short)%1f%(worktreepath)')
 
 printf '%s\n' "${ROWS[@]}"
 
@@ -208,11 +219,11 @@ printf '%s\n' "${ROWS[@]}"
 if [ ${#CONFL[@]} -gt 0 ]; then
   section "KONFLIKTY — INFO DLA OWNERA (żaden merge nie został wykonany)"
   for c in "${CONFL[@]}"; do
-    IFS='|' read -r b behind ahead owners files nfiles <<<"$c"
+    IFS="$SEP" read -r b behind ahead owners files nfiles <<<"$c"
     echo "gałąź: $b   (ahead $ahead / behind $behind względem $BASE)"
     echo "  owner (autorzy commitów na gałęzi): $owners"
     echo "  pliki w konflikcie ($nfiles): $files"
-    echo "  do ręcznego rozwiązania przez ownera: git switch $b; git merge $BASE"
+    echo "  do ręcznego rozwiązania przez ownera: git switch $(quote_arg "$b"); git merge $(quote_arg "$BASE")"
   done
 fi
 
@@ -243,3 +254,5 @@ fi
 
 echo
 echo "podsumowanie: aktualne=$(printf '%s\n' "${ROWS[@]}" | grep -c '|UP_TO_DATE|') zaktualizowane=${#UPDATED[@]} konflikty=${#CONFL[@]} pominięte=$(printf '%s\n' "${ROWS[@]}" | grep -c '|SKIP_') błędy=$(printf '%s\n' "${ROWS[@]}" | grep -c '|ERROR|')"
+
+exit "$FAILED"

@@ -1,266 +1,179 @@
-# claude-skills
+# Skills dla Claude i Codexa
 
-Globalne skille dla **Claude Code** (CLI, zakładka Code w Claude Desktop,
-rozszerzenia IDE). Każdy skill to osobny katalog z plikiem `SKILL.md`.
+Repo przechowuje oddzielne instrukcje dla każdego klienta i samodzielne paczki:
 
-| Skill | Polecenie | Co robi |
-|---|---|---|
-| [`git-clean`](git-clean/) | `/git-clean` | Audyt higieny repozytorium git + bezpieczne sprzątanie gałęzi, stasha i worktree, synchronizacja gałęzi z `origin/<default>`, raport HTML |
+```text
+claude/skills/git-clean/   # /git-clean w Claude Code
+codex/skills/git-clean/    # $git-clean w Codexie
+shared/git-clean/          # źródła wspólnych skryptów
+tools/build_skills.py     # pakowanie do katalogów dostawców
+tests/                    # testy na tymczasowych repozytoriach
+```
 
----
+Nowy klient może dostać `<klient>/skills/git-clean/SKILL.md`. Skrypt pakujący
+odnajduje takie katalogi automatycznie. Każda paczka zawiera wszystkie skrypty;
+po instalacji nie zależy od katalogu `shared/` ani API drugiego dostawcy.
 
 ## git-clean
 
-Audyt repozytorium git, z którego go uruchamiasz:
+Audyt gałęzi, stashy i worktree, plan sprzątania oraz synchronizacja z gałęzią
+domyślną. Rozpoznaje merge, patche po rebase i squash. Pokazuje pracę tylko
+lokalną, rozjazdy upstreamu i konflikty z bazą.
 
-- gałęzie lokalne i zdalne już wmergowane do `main`/`master` — także
-  **squash-merge** i **rebase** (których `git branch --merged` nie widzi),
-- gałęzie porzucone, z rozjazdem z upstreamem, z upstreamem usuniętym na serwerze,
-- commity istniejące **tylko lokalnie** (praca, której nie ma nigdzie indziej),
-- stashe — które już są w bazie (do usunięcia), a które niosą istotną treść,
-- worktree (także martwe wpisy), tagi niewypchnięte, stan `gc`,
-- **synchronizacja**: fast-forward gałęzi domyślnej i merge `origin/<default>`
-  do pozostałych gałęzi — **tylko gdy nie ma konfliktów** (sprawdzane
-  `git merge-tree`); konflikty trafiają do raportu jako informacja dla ownera,
-- na końcu gotowe komendy `git push` dla zaktualizowanych gałęzi.
+Raport HTML zawiera graf DAG z etykietami gałęzi lokalnych, remote, tagów i HEAD,
+wybór historii gałęzi, powiększanie, kolorowe oznaczenia kandydatów do usunięcia
+i pracy tylko lokalnej, filtrowane tabele, plan A–E oraz migawki „przed → po”.
+Graf pokazuje rzeczywistych rodziców commitów: squash/rebase nie tworzy fikcyjnego
+połączenia z dawną gałęzią. Równoważność treści jest sprawdzana osobno w tabelach.
+Domyślnie pokazuje 120 commitów, maksymalnie 1000. Raport działa offline, bez CDN.
 
-Wynik to **raport HTML** (filtry, sortowanie, przyciski „Kopiuj”) i krótkie
-podsumowanie w czacie.
+## Bezpieczeństwo
 
-### Zasada bezpieczeństwa
+Najpierw raport i podgląd, potem konkretny wybór użytkownika. Sama prośba o audyt
+nie oznacza zgody na synchronizację ani kasowanie.
 
-**Najpierw raport, potem pytanie, dopiero potem akcja.** Skill niczego nie
-kasuje w kroku analizy. Plan sprzątania jest podzielony na bloki, a Ty
-zatwierdzasz każdy osobno:
-
-| Blok | Zawartość |
+| Blok | Zakres |
 |---|---|
-| **A** | lokalne gałęzie bezpieczne do usunięcia (treść już jest w bazie) |
-| **B** | gałęzie na remote do usunięcia (zmiana współdzielona — osobna zgoda) |
-| **C** | stashe do usunięcia (treść już w bazie / w drzewie / puste) |
-| **D** | sprzątanie techniczne: `git remote prune`, `git worktree prune`, `git gc` |
-| **E** | pozycje wymagające decyzji — każda osobno (porzucone gałęzie, stash z istotną treścią itd.) |
+| A | lokalne gałęzie z treścią już w bazie |
+| B | gałęzie remote — osobna zgoda i świeże dane |
+| C | stashe bez osobnej, potrzebnej treści |
+| D | prune i gc |
+| E | indywidualne decyzje i ratowanie pracy |
 
-Każde polecenie kasujące ma w komentarzu SHA do odzysku
-(`git branch <nazwa> <sha>`, `git stash store <sha>`).
+Indeks stasha jest sprawdzany osobno od jego drzewa roboczego i plików
+nieśledzonych. Jeśli zawiera osobną treść albo nie został sprawdzony w starym
+audycie, stash zostaje do oceny. Metadane są kodowane w audycie, komendy cytowane
+dla konkretnej powłoki (`--shell bash` / `--shell powershell`). Instrukcje wymagają
+ponownej weryfikacji SHA przed mutacją. Nieświeże dane wyłączają blok B.
 
-Czego skill **nigdy** nie robi: `push --force`, `reset --hard`, `clean -fd`,
-`stash clear`, kasowanie bieżącej / domyślnej / chronionej gałęzi
-(`main`, `master`, `develop`, `trunk`, `release/*`, `hotfix/*`), automatyczne
-rozwiązywanie konfliktów. Push zaktualizowanych gałęzi wykonujesz **sam** —
-skill tylko podaje komendy.
+Nie usuwa się gałęzi bieżącej, domyślnej, chronionej ani wystawionej w worktree.
+Chronione: main, master, develop, trunk, release/*, hotfix/*. Sync pomija brudne
+worktree (także pliki nieśledzone), konflikty i inne worktree bez wyraźnego wyboru
+`--sync-worktrees`. Błąd przerywa wykonanie z niezerowym kodem. Nieznany argument
+również kończy skrypt błędem — literówka w `--dry-run` nie uruchomi synchronizacji.
 
----
+Merge gałęzi poza worktree używa `commit-tree` i `update-ref` ze sprawdzeniem
+starego SHA, pomijając hooki i podpisy. Raport ostrzega, jeśli repo ich wymaga.
+Brak konfliktów tekstowych nie zastępuje bramki projektu przed pushem.
+Audyt zapisuje pliki i tymczasowe obiekty Git; nie zmienia lokalnych gałęzi i nic
+nie kasuje. Fetch odświeża refs bez prune. Podgląd sync zapisuje obiekty merge-tree
+bez aktualizacji gałęzi.
 
 ## Wymagania
 
-| Co | Po co | Uwagi |
-|---|---|---|
-| **Claude Code** (CLI, zakładka *Code* w Claude Desktop albo rozszerzenie IDE) | uruchamia skill | patrz „Gdzie to działa” niżej |
-| **git ≥ 2.38** | `merge-tree --write-tree` w kroku synchronizacji | starszy git: audyt i raport działają, sync zgłosi błąd |
-| **bash** | skrypty `audit.sh` / `sync.sh` | Windows: **Git Bash** z Git for Windows (nie bash z WSL) |
-| **Python 3.8+** | raport HTML (`report.py`) | bez Pythona działa audyt i sync, nie ma raportu |
-| `timeout` (coreutils) | limit czasu `git fetch` | opcjonalnie; macOS: `brew install coreutils` daje `gtimeout` |
-
-### Gdzie to działa
-
-- ✅ **Claude Code CLI** (`claude` w terminalu) — Linux, macOS, Windows.
-- ✅ **Claude Desktop → zakładka Code** — korzysta z tego samego katalogu
-  `~/.claude/skills`, więc instalacja jest wspólna z CLI.
-- ✅ **Rozszerzenia Claude Code dla VS Code / JetBrains** — jw.
-- ❌ **Zwykły czat claude.ai / Claude Desktop (zakładka Chat)** — skill wymaga
-  lokalnego `git` i powłoki na Twojej maszynie, a czat działa w zdalnej
-  piaskownicy bez dostępu do Twoich repozytoriów. Wgranie go tam jako ZIP
-  nie ma sensu.
-
----
+Git 2.38+ do synchronizacji, Bash (Windows: Git Bash), Python 3.8+ do raportu,
+lokalna sesja klienta z dostępem do repo i powłoki. Bez zależności Pythona.
 
 ## Instalacja
 
-Skill **musi** leżeć w katalogu globalnych skilli użytkownika
-`~/.claude/skills/git-clean/` — `SKILL.md` odwołuje się do skryptów właśnie
-tą ścieżką. (Instalacja per-projekt w `.claude/skills/` repozytorium nie zadziała
-bez edycji ścieżek w `SKILL.md`.)
+Klon zostaje w `C:\dev\claude-skills`. Można zainstalować obie wersje jednocześnie.
+Instrukcje używają ścieżki załadowanego skilla; działają również jako kopia albo
+w katalogu skilli konkretnego projektu.
 
-Polecana metoda to **klon repo + dowiązanie** — wtedy aktualizacja to jeden
-`git pull`. Alternatywnie zwykła kopia.
-
-### Linux / macOS
-
-```bash
-git clone git@github.com:yautay/claude-skills.git ~/claude-skills
-mkdir -p ~/.claude/skills
-ln -s ~/claude-skills/git-clean ~/.claude/skills/git-clean
-```
-
-Wariant bez dowiązania (kopia):
-
-```bash
-cp -r ~/claude-skills/git-clean ~/.claude/skills/
-```
-
-### Windows (PowerShell)
+Windows — Claude Code:
 
 ```powershell
-git clone git@github.com:yautay/claude-skills.git "$env:USERPROFILE\claude-skills"
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
-New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\git-clean" -Target "$env:USERPROFILE\claude-skills\git-clean"
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\git-clean" -Target 'C:\dev\claude-skills\claude\skills\git-clean'
 ```
 
-Junction nie wymaga uprawnień administratora ani trybu deweloperskiego.
-Wariant bez dowiązania (kopia):
+Windows — Codex:
 
 ```powershell
-Copy-Item -Recurse "$env:USERPROFILE\claude-skills\git-clean" "$env:USERPROFILE\.claude\skills\"
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.agents\skills" | Out-Null
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills\git-clean" -Target 'C:\dev\claude-skills\codex\skills\git-clean'
 ```
 
-> **Końce linii:** repo ma `.gitattributes` wymuszające LF dla skryptów `.sh`
-> i `.py`, więc klon działa także przy `core.autocrlf=true`. Jeśli kopiujesz
-> pliki inną drogą (ZIP z GitHuba, edytor), pilnuj, żeby `*.sh` zostały z LF —
-> z CRLF bash zgłosi `$'\r': command not found`.
+Repozytoryjna instalacja Codexa: skopiuj paczkę do `.agents/skills/git-clean/`.
+[Dokumentacja skilli Codexa](https://learn.chatgpt.com/docs/build-skills).
 
-### Bez SSH do GitHuba
-
-Zamiast `git@github.com:...` użyj HTTPS:
-`https://github.com/yautay/claude-skills.git` (dla prywatnego repo wymaga
-zalogowania, np. przez `gh auth login` albo Git Credential Manager).
-
-### Sprawdzenie instalacji
-
-1. Uruchom **nową** sesję Claude Code (skille są wczytywane przy starcie sesji;
-   w Claude Desktop — nowa sesja w zakładce Code).
-2. Wpisz `/` — na liście poleceń powinno być `/git-clean`.
-   Ewentualnie zapytaj: „jakie masz skille?”.
-3. Szybki test samych skryptów, bez Claude (w dowolnym repo git):
-
-   ```bash
-   bash ~/.claude/skills/git-clean/audit.sh --no-fetch
-   bash ~/.claude/skills/git-clean/report.sh
-   ```
-
-   W PowerShellu:
-
-   ```powershell
-   & "$env:USERPROFILE\.claude\skills\git-clean\run.ps1" audit --no-fetch
-   & "$env:USERPROFILE\.claude\skills\git-clean\run.ps1" report --open
-   ```
-
-### Aktualizacja
+Linux/macOS, z korzenia klonu:
 
 ```bash
-git -C ~/claude-skills pull
+mkdir -p ~/.claude/skills ~/.agents/skills
+ln -s "$PWD/claude/skills/git-clean" ~/.claude/skills/git-clean
+ln -s "$PWD/codex/skills/git-clean" ~/.agents/skills/git-clean
 ```
 
-Przy instalacji przez dowiązanie/junction to wszystko. Przy kopii — skopiuj
-katalog ponownie. Po zmianie `SKILL.md` uruchom nową sesję Claude Code.
+Zamiast dowiązania można skopiować cały katalog skilla. Przy kopii aktualizacja
+wymaga ponownego skopiowania. Przy dowiązaniu wystarcza `git pull`.
 
-### Odinstalowanie
-
-```bash
-rm ~/.claude/skills/git-clean          # dowiązanie (Linux/macOS)
-rm -rf ~/.claude/skills/git-clean      # kopia
-```
-
-```powershell
-# junction: usuwa samo dowiązanie, NIE zawartość klonu
-(Get-Item "$env:USERPROFILE\.claude\skills\git-clean").Delete()
-# kopia
-Remove-Item -Recurse -Force "$env:USERPROFILE\.claude\skills\git-clean"
-```
-
----
+**Migracja starej instalacji:** `git-clean/` w korzeniu zostało zastąpione przez
+`claude/skills/git-clean/`. Stare dowiązanie trzeba utworzyć ponownie do nowej
+ścieżki. Usuwaj samo dowiązanie, nie jego cel; kopia wymaga innego postępowania.
+Jeśli klient nie widzi skilla po aktualizacji, rozpocznij nową sesję.
 
 ## Użycie
 
-W sesji Claude Code otwartej w katalogu repozytorium:
-
-```
-/git-clean
-```
-
-albo naturalnym językiem: „posprzątaj gałęzie”, „co mogę usunąć z gita?”,
-„przejrzyj stash”, „zaktualizuj gałęzie o master”.
-
-### Argumenty
+Claude: `/git-clean`. Codex: `$git-clean`. Można też poprosić o audyt gałęzi/stashy.
 
 | Argument | Działanie |
 |---|---|
-| `--no-fetch` | bez `git fetch` — dane remote z ostatniego fetcha (np. offline, bez VPN) |
-| `--stale-days N` | po ilu dniach bez commita niezmergowana gałąź jest „porzucona” (domyślnie 90) |
-| `--remote-limit N` | pełna detekcja squash/rebase tylko dla N najświeższych gałęzi remote (domyślnie 100) |
-| `--no-sync` | pomija synchronizację gałęzi z bazą |
-| `--sync-worktrees` | synchronizuje też gałęzie wystawione w **innych** worktree (domyślnie są pomijane — ktoś może tam pracować) |
+| --no-fetch | dane remote z ostatniego fetcha |
+| --stale-days N | próg porzuconej gałęzi; domyślnie 90 |
+| --remote-limit N | limit pełnej detekcji squash/rebase remote; domyślnie 100 |
+| --graph-limit N | zakres grafu: domyślnie 120, maksymalnie 1000 |
+| --no-sync | pomija sync; raport musi dostać --sync none |
+| --sync-worktrees | obejmuje inne worktree, po wyraźnym wyborze |
 
-Przykład: `/git-clean --no-fetch --stale-days 30`
+Test bez klienta, z katalogu sprawdzanego repo:
 
-### Przebieg
-
-1. **Fakty** — `audit.sh` (z `git fetch` z timeoutem; nieudany fetch nie jest
-   ponawiany, raport oznacza dane remote jako nieaktualne) i podgląd
-   synchronizacji `sync.sh --dry-run`.
-2. **Raport** — `report.py` klasyfikuje gałęzie i stashe deterministycznie,
-   buduje plan A–E i zapisuje raport HTML. Claude pokazuje raport, podaje
-   komendę do otwarcia go w przeglądarce i streszcza wynik w kilku liniach.
-3. **Pytanie** — wybierasz, które bloki (i które pozycje bloku E) wykonać.
-   Brak zgody = nic się nie dzieje.
-4. **Wykonanie** — wyłącznie zatwierdzone polecenia, jedno po drugim,
-   z raportem wyniku każdego. Błąd = stop, bez obchodzenia.
-5. **Synchronizacja** — fast-forward gałęzi domyślnej, merge `origin/<default>`
-   do gałęzi bez konfliktów. Claude sprawdza w `CLAUDE.md`/`AGENTS.md` repo
-   wymagany format commita (znacznik w temacie, stopka) i przekazuje go do
-   merge-commitów.
-6. **Stan końcowy** — ponowny audyt, sekcja „przed → po” i blok komend
-   `git push` do wykonania przez Ciebie, wraz ze starymi SHA i sposobem cofnięcia.
-
-### Gdzie lądują wyniki
-
-Wszystko w `.git/git-clean/` sprawdzanego repo — **nigdy** w drzewie roboczym,
-więc nic nie pojawia się w `git status`:
-
-```
-.git/git-clean/
-├── audit.txt          # surowe wyjście audit.sh
-├── sync-dryrun.txt    # podgląd synchronizacji
-├── sync-apply.txt     # wynik wykonanej synchronizacji
-├── report.html        # raport do obejrzenia w przeglądarce
-└── history/*.json     # migawki do porównania „przed → po” (ostatnie 20)
+```powershell
+& 'C:\dev\claude-skills\codex\skills\git-clean\run.ps1' audit --no-fetch
+& 'C:\dev\claude-skills\codex\skills\git-clean\run.ps1' sync --dry-run
+& 'C:\dev\claude-skills\codex\skills\git-clean\run.ps1' report --sync dryrun --shell powershell --open
 ```
 
-Otwarcie raportu poza Claude:
+Wyniki: `<git-common-dir>/git-clean/` — audit.txt, sync-dryrun.txt, sync-apply.txt,
+report.html i history/*.json. W zwykłym repo to `.git/git-clean/`; w worktree
+raport leży we wspólnym katalogu Git.
+
+## Rozwój
+
+Zmieniaj skrypty w `shared/git-clean/`, instrukcje w katalogu konkretnego klienta.
 
 ```bash
-start "" ".git/git-clean/report.html"     # Windows (Git Bash / cmd)
-open .git/git-clean/report.html           # macOS
-xdg-open .git/git-clean/report.html       # Linux
+python tools/build_skills.py
+python tools/build_skills.py --check
+python -m unittest discover -s tests -v
 ```
 
----
+`.gitattributes` wymusza LF dla Bash/Pythona i CRLF dla PowerShella. Launcher ma
+BOM dla UTF-8 w Windows PowerShell 5.1. Testy tworzą własne repozytoria i nie
+sprzątają repo użytkownika.
 
-## Budowa skilla
 
-| Plik | Rola |
-|---|---|
-| `SKILL.md` | instrukcja dla Claude: kolejność kroków, reguły bezpieczeństwa, co pokazać użytkownikowi |
-| `audit.sh` | zbiera fakty (tylko odczyt + `git fetch` bez `--prune`) |
-| `sync.sh` | synchronizacja z `origin/<default>`; `--dry-run` tylko czyta |
-| `report.py` | klasyfikacja, plan A–E, raport HTML, streszczenie dla modelu |
-| `report.sh` | uruchamia `report.py` pierwszym działającym Pythonem 3.8+ |
-| `run.ps1` | launcher dla PowerShella: znajduje **Git Bash** obok `git.exe` (nie bash z WSL) i ustawia UTF-8 |
+## Domyślny koszt modelu
 
-Podział jest celowy: skrypty liczą, model niczego nie klasyfikuje sam —
-bierze liczby i polecenia z wyjścia `report.py`. Dzięki temu skill działa
-na tańszym modelu: we frontmatterze `SKILL.md` jest
-`model: claude-haiku-4-5-20251001`. Chcesz inny model — zmień tę linię
-albo ją usuń (wtedy skill pójdzie modelem sesji).
+- Claude Code: `model: haiku` i `effort: low` w frontmatterze skilla. Model
+  sesji wraca po zakończeniu wywołania zgodnie z mechanizmem Claude Code.
+- Codex: wykonawca `gpt-6-luna`, reasoning `low`. Entrypoint `$git-clean`
+  zleca workflow jednemu subagentowi z jawnym wyborem modelu i minimalnym
+  kontekstem. Nadrzędny agent prezentuje wynik i przekazuje decyzje użytkownika.
 
-### Uwagi techniczne
+Codex nie ma udokumentowanego pola `model` we frontmatterze `SKILL.md`.
+Dlatego w paczce jest także `launch_codex.py`, który uruchamia interaktywną
+sesję CLI na Lunie, bez zmiany globalnego modelu i bez obchodzenia zgód/sandboxa:
 
-- Gałąź **niewystawiona** w żadnym worktree jest aktualizowana bez dotykania
-  drzewa roboczego (`commit-tree` + `update-ref` ze sprawdzeniem starej
-  wartości). Taki merge-commit **nie uruchamia hooków** (`pre-commit`,
-  `commit-msg`) i **nie jest podpisany** GPG — raport ostrzega o tym, jeśli
-  repo ma hooki albo `commit.gpgsign=true`.
-- Brak konfliktów tekstowych nie znaczy, że kod się zbuduje — przed push
-  uruchom testy/bramkę projektu na zaktualizowanych gałęziach.
-- Wykrywanie squash-merge tworzy tymczasowe obiekty commit (wiszące, sprząta
-  je `git gc`) — nie zmienia żadnej gałęzi.
+```powershell
+python 'C:\dev\claude-skills\codex\skills\git-clean\launch_codex.py' --repo 'C:\dev\wybrane-repo' -- --no-fetch
+```
+
+Podgląd argumentów bez uruchamiania ani opłaty za model:
+
+```powershell
+python 'C:\dev\claude-skills\codex\skills\git-clean\launch_codex.py' --repo 'C:\dev\wybrane-repo' --dry-run -- --no-fetch
+```
+
+Sam import skilla nie przełącza modelu nadrzędnego chatu Codexa. Wymagane jest
+narzędzie delegowania z wyborem modelu albo launcher CLI. Brak Luny nie oznacza
+zgody na droższy model: wykonanie ma się zatrzymać. Jawny wybór użytkownika
+może zmienić model. Skrypty liczą klasyfikację i budują graf bez używania LLM.
+
+Wybór Luny sprawdzono 2026-10-06 w
+[dokumentacji modeli OpenAI](https://learn.chatgpt.com/docs/model-selection) i
+[cenniku Codexa](https://learn.chatgpt.com/docs/pricing).
+Wybór modelu subagenta:
+[dokumentacja OpenAI](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+Frontmatter Claude:
+[dokumentacja Claude Code](https://code.claude.com/docs/en/skills).
