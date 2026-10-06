@@ -13,6 +13,7 @@
 #   --no-sync       dotyczy tylko SKILL.md (krok synchronizacji); tu ignorowany
 
 set -u
+source "$(dirname "$0")/common.sh"
 export LC_ALL=C
 export GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=8}"
@@ -20,20 +21,23 @@ export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeou
 # Kopia wyjścia dla report.py: uruchom się ponownie z tee do .git/git-clean/.
 if [ -z "${GIT_CLEAN_TEED:-}" ] && git rev-parse --git-dir >/dev/null 2>&1; then
   OUTDIR="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/git-clean"
-  mkdir -p "$OUTDIR"
+  mkdir -p "$OUTDIR" || exit 2
   GIT_CLEAN_TEED=1 bash "$0" "$@" 2>&1 | tee "$OUTDIR/audit.txt"
-  exit "${PIPESTATUS[0]}"
+  codes=("${PIPESTATUS[@]}")
+  [ "${codes[0]}" -ne 0 ] && exit "${codes[0]}"
+  exit "${codes[1]}"
 fi
 
-FETCH=1; STALE_DAYS=90; FETCH_TIMEOUT=40; REMOTE_LIMIT=100
+FETCH=1; STALE_DAYS=90; FETCH_TIMEOUT=40; REMOTE_LIMIT=100; GRAPH_LIMIT=120
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-fetch) FETCH=0 ;;
-    --stale-days) STALE_DAYS="$2"; shift ;;
-    --fetch-timeout) FETCH_TIMEOUT="$2"; shift ;;
-    --remote-limit) REMOTE_LIMIT="$2"; shift ;;
+    --stale-days) STALE_DAYS="${2:-}"; shift ;;
+    --fetch-timeout) FETCH_TIMEOUT="${2:-}"; shift ;;
+    --remote-limit) REMOTE_LIMIT="${2:-}"; shift ;;
+    --graph-limit) GRAPH_LIMIT="${2:-}"; shift ;;
     --no-sync|--sync-worktrees) ;;
-    *) echo "nieznany argument: $1" >&2 ;;
+    *) echo "nieznany argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
@@ -42,6 +46,15 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
   echo "BŁĄD: to nie jest repozytorium git: $(pwd)"; exit 2
 fi
 
+for value in "$STALE_DAYS" "$FETCH_TIMEOUT" "$REMOTE_LIMIT" "$GRAPH_LIMIT"; do
+  positive_integer "$value" || { echo "BŁĄD: oczekiwano dodatniej liczby całkowitej" >&2; exit 2; }
+done
+[ "$GRAPH_LIMIT" -le 1000 ] || { echo "BŁĄD: --graph-limit maksymalnie 1000" >&2; exit 2; }
+STALE_DAYS=$((10#$STALE_DAYS)); FETCH_TIMEOUT=$((10#$FETCH_TIMEOUT))
+REMOTE_LIMIT=$((10#$REMOTE_LIMIT)); GRAPH_LIMIT=$((10#$GRAPH_LIMIT))
+git rev-parse --show-toplevel >/dev/null 2>&1 && git rev-parse --verify HEAD >/dev/null 2>&1 || {
+  echo "BŁĄD: potrzebne jest niepuste repozytorium z drzewem roboczym" >&2; exit 2;
+}
 NOW=$(date +%s)
 STALE_SEC=$((STALE_DAYS * 86400))
 age_days() { echo $(( (NOW - $1) / 86400 )); }
@@ -57,8 +70,9 @@ GITDIR=$(git rev-parse --git-dir)
 CUR=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "(detached HEAD @ $(git rev-parse --short HEAD 2>/dev/null))")
 
 section "REPO"
-echo "root: $TOP"
-echo "current_branch: $CUR"
+echo "format_version: 2"
+echo "root: $(encode_field "$TOP")"
+echo "current_branch: $(encode_field "$CUR")"
 echo "git: $(git --version)"
 echo "generated_at: $NOW"
 
@@ -107,8 +121,8 @@ fi
 [ -z "$DEF" ] && DEF=$(git symbolic-ref --quiet --short HEAD 2>/dev/null)
 BASE="$DEF"
 if [ -n "$R" ] && git show-ref --verify --quiet "refs/remotes/$R/$DEF"; then BASE="$R/$DEF"; fi
-echo "default_branch: $DEF"
-echo "comparison_base: $BASE"
+echo "default_branch: $(encode_field "$DEF")"
+echo "comparison_base: $(encode_field "$BASE")"
 for c in main master develop trunk; do
   l=$(git show-ref --verify --quiet "refs/heads/$c" && echo local)
   r=$([ -n "$R" ] && git show-ref --verify --quiet "refs/remotes/$R/$c" && echo remote)
@@ -139,7 +153,7 @@ pr=$(git worktree prune --dry-run -v 2>&1)
 squash_merged() { # $1 branch-ref, $2 base
   local mb tmp
   mb=$(git merge-base "$2" "$1" 2>/dev/null) || return 1
-  tmp=$(git commit-tree "$1^{tree}" -p "$mb" -m tmp 2>/dev/null) || return 1
+  tmp=$(git -c commit.gpgsign=false commit-tree "$1^{tree}" -p "$mb" -m tmp 2>/dev/null) || return 1
   case "$(git cherry "$2" "$tmp" 2>/dev/null)" in -*) return 0 ;; esac
   return 1
 }
@@ -154,7 +168,9 @@ merge_status() { # $1 ref, $2 base -> contained|merged|rebased|squashed|NOT_MERG
     if grep -qx "$(git rev-parse "$1^{commit}")" "$FPFILE"; then echo contained; else echo merged; fi
     return
   fi
-  if [ -z "$(git cherry "$2" "$1" 2>/dev/null | grep '^+')" ]; then echo rebased; return; fi
+  local cherry
+  cherry=$(git cherry "$2" "$1" 2>/dev/null) || { echo UNKNOWN; return; }
+  if ! printf '%s\n' "$cherry" | grep -q '^+'; then echo rebased; return; fi
   if squash_merged "$1" "$2"; then echo squashed; return; fi
   echo NOT_MERGED
 }
@@ -162,8 +178,8 @@ merge_status() { # $1 ref, $2 base -> contained|merged|rebased|squashed|NOT_MERG
 # ---------- local branches ----------
 section "LOCAL BRANCHES"
 echo "# name|upstream|track|vs_upstream(ahead/behind)|vs_base(ahead/behind)|merge_status|local_only_commits|age_days|author|worktree|sha|subject"
-git for-each-ref refs/heads --format='%(refname:short)|%(upstream:short)|%(upstream:track)|%(committerdate:unix)|%(authorname)|%(worktreepath)|%(objectname)|%(subject)' |
-while IFS='|' read -r b up track ct author wt sha subj; do
+git for-each-ref refs/heads --format='%(refname:short)%1f%(upstream:short)%1f%(upstream:track)%1f%(committerdate:unix)%1f%(authorname)%1f%(worktreepath)%1f%(objectname)%1f%(subject)' |
+while IFS="$SEP" read -r b up track ct author wt sha subj; do
   vu="-"
   if [ -n "$up" ] && git rev-parse -q --verify "$up" >/dev/null; then
     set -- $(git rev-list --left-right --count "$b...$up"); vu="$1/$2"
@@ -171,7 +187,7 @@ while IFS='|' read -r b up track ct author wt sha subj; do
   set -- $(git rev-list --left-right --count "$b...$BASE" 2>/dev/null); vb="${1:-?}/${2:-?}"
   if [ "$b" = "$DEF" ]; then ms="(default)"; else ms=$(merge_status "refs/heads/$b" "$BASE"); fi
   lo=$([ -n "$R" ] && git rev-list --count "refs/heads/$b" --not --remotes 2>/dev/null || echo n/a)
-  echo "$b|${up:--}|${track:--}|$vu|$vb|$ms|$lo|$(age_days "$ct")|$author|${wt:--}|${sha:0:12}|$subj"
+  row "$b" "${up:--}" "${track:--}" "$vu" "$vb" "$ms" "$lo" "$(age_days "$ct")" "$author" "${wt:--}" "$sha" "$subj"
 done
 
 # ---------- remote branches ----------
@@ -182,8 +198,8 @@ if [ -n "$R" ]; then
   # Od najświeższych: pełna detekcja squash/rebase (kosztowna — `git cherry` od
   # merge-base) tylko dla pierwszych REMOTE_LIMIT gałęzi.
   i=0
-  git for-each-ref --sort=-committerdate "refs/remotes/$R" --format='%(refname:short)|%(committerdate:unix)|%(authorname)|%(objectname)|%(subject)' |
-  while IFS='|' read -r rb ct author sha subj; do
+  git for-each-ref --sort=-committerdate "refs/remotes/$R" --format='%(refname:short)%1f%(committerdate:unix)%1f%(authorname)%1f%(objectname)%1f%(subject)' |
+  while IFS="$SEP" read -r rb ct author sha subj; do
     [ "$rb" = "$R" ] || [ "$rb" = "$R/HEAD" ] && continue
     i=$((i + 1))
     short=${rb#"$R"/}
@@ -194,7 +210,7 @@ if [ -n "$R" ]; then
       if grep -qx "$sha" "$FPFILE"; then ms=contained; else ms=merged; fi
     else ms=UNCHECKED; fi
     hl=$(git show-ref --verify --quiet "refs/heads/$short" && echo yes || echo no)
-    echo "$short|$vb|$ms|$(age_days "$ct")|$author|$hl|${sha:0:12}|$subj"
+    row "$short" "$vb" "$ms" "$(age_days "$ct")" "$author" "$hl" "$sha" "$subj"
   done
 
   section "STALE REMOTE-TRACKING REFS (usunięte na serwerze, wiszą lokalnie)"
@@ -210,8 +226,8 @@ section "STASH"
 n=$(git stash list | wc -l | tr -d ' ')
 echo "count: $n"
 if [ "$n" -gt 0 ]; then
-  echo "# ref|age_days|created_on|files|untracked_part|base_reachable_from|identical_in_HEAD|identical_in_base|still_applies_reverse(=już jest w drzewie)|sha|file_list(do 10)|message"
-  git stash list --format='%gd|%ct|%H|%gs' | while IFS='|' read -r ref ct ssha msg; do
+  echo "# ref|age_days|created_on|files|untracked_part|base_reachable_from|identical_in_HEAD|identical_in_base|still_applies_reverse(=już jest w drzewie)|sha|file_list(do 10)|index_state|message"
+  git stash list --format='%gd%x1f%ct%x1f%H%x1f%gs' | while IFS="$SEP" read -r ref ct ssha msg; do
     files=$(git diff --name-only "$ref^1" "$ref" 2>/dev/null)
     nf=$(printf '%s\n' "$files" | grep -c .)
     flist=$(printf '%s\n' "$files" | grep . | head -10 | tr '|' '/' | paste -sd ',' -)
@@ -229,8 +245,14 @@ if [ "$n" -gt 0 ]; then
     done <<EOF
 $files
 EOF
-    rev=$(git diff "$ref^1" "$ref" | git apply --check -R 2>/dev/null && echo yes || echo no)
-    echo "$ref|$(age_days "$ct")|$(echo "$msg" | sed -nE 's/^(WIP on|On) ([^:]*):.*/\2/p')|$nf|$ut|${reach:-NIEOSIĄGALNY}|$same_head/$nf|$same_base/$nf|$rev|${ssha:0:12}|${flist:--}|$msg"
+    index_state=unknown
+    if git rev-parse --verify "$ref^2" >/dev/null 2>&1; then
+      if git diff --quiet "$ref^1" "$ref^2"; then index_state=base
+      elif git diff --quiet "$ref^2" "$ref"; then index_state=worktree
+      else index_state=distinct; fi
+    fi
+    rev=$(git diff --binary "$ref^1" "$ref" | git apply --check -R 2>/dev/null && echo yes || echo no)
+    row "$ref" "$(age_days "$ct")" "$(echo "$msg" | sed -nE 's/^(WIP on|On) ([^:]*):.*/\2/p')" "$nf" "$ut" "${reach:-NIEOSIĄGALNY}" "$same_head/$nf" "$same_base/$nf" "$rev" "$ssha" "${flist:--}" "$index_state" "$msg"
   done
 fi
 
@@ -245,3 +267,19 @@ fi
 section "REPO HEALTH"
 git count-objects -vH 2>/dev/null | grep -E 'count|size-pack|garbage'
 echo "stale_days_threshold: $STALE_DAYS"
+
+
+# Bounded commit DAG; separate refs retain branch/tag names without parsing decorations.
+section "GRAPH COMMITS"
+echo "graph_limit: $GRAPH_LIMIT"
+echo "# oid|parents|author|subject"
+git log HEAD --branches --remotes --tags --topo-order -n "$((GRAPH_LIMIT + 1))" --format='%H%x1f%P%x1f%an%x1f%s' |
+while IFS="$SEP" read -r oid parents author subject; do row "$oid" "$parents" "$author" "$subject"; done
+section "GRAPH REFS"
+echo "# ref|oid"
+git for-each-ref refs/heads refs/remotes refs/tags --format='%(refname)%1f%(objectname)%1f%(*objectname)%1f%(objecttype)' |
+while IFS="$SEP" read -r ref oid peeled kind; do
+  [ "$kind" = tag ] && oid="$peeled"
+  row "$ref" "$oid"
+done
+row HEAD "$(git rev-parse HEAD)"
